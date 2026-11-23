@@ -64,7 +64,7 @@ type NewExecution = {
   date: string;
   systemId: string;
   changeItem: string;
-  changeTime: string | number;
+  changeTime: number;
   notes: string;
   sourceText: string;
 };
@@ -144,7 +144,7 @@ function normalizeChangeTime(raw: CellValue): number | "" | null {
 }
 
 // ===== 來源排程解析（純資料）=====
-type SourceMetadata = { systemId: string; changeItem: string; changeTime: string | number };
+type SourceMetadata = { systemId: string; changeItem: string; changeTime: number };
 /** 一筆應存在的執行追蹤：排程格式的一行，或一般注意事項的整格。 */
 type DesiredExecution = {
   changeId: string;
@@ -163,6 +163,8 @@ type SourceStats = {
   blankRows: number;
   completedRows: number;
   missingChangeIdRows: number;
+  /** 缺少或無法辨識系統編號／變更項目／變更時間而略過的列。 */
+  missingRequiredRows: number;
   activeRows: number;
   scheduleLineEntries: number;
   fallbackEntries: number;
@@ -247,7 +249,7 @@ function parseSourceSchedule(texts: string[][], values: CellValue[][]): SourceSc
     systemId: systemCol, changeItem: itemCol, changeTime: timeCol
   };
   const stats: SourceStats = {
-    dataRows: texts.length - 1, blankRows: 0, completedRows: 0, missingChangeIdRows: 0,
+    dataRows: texts.length - 1, blankRows: 0, completedRows: 0, missingChangeIdRows: 0, missingRequiredRows: 0,
     activeRows: 0, scheduleLineEntries: 0, fallbackEntries: 0, invalidDateEntries: 0, formatWarnings: 0
   };
 
@@ -272,17 +274,27 @@ function parseSourceSchedule(texts: string[][], values: CellValue[][]): SourceSc
       errors.push(`主表第 ${rowNumber} 列變更結果空白但缺少聯繫單號。`);
       continue;
     }
+    // 系統編號、變更項目、變更時間為必填：缺少或無法辨識時略過整列（不建立任何紀錄），
+    // 每次同步都會提醒，直到來源補齊為止。不寫入半套資料，因為既有列之後不會被覆寫。
+    const systemId = (row[systemCol] || "").trim();
+    const changeItem = (row[itemCol] || "").trim();
+    const rawTime = values[i][timeCol];
+    const changeTime = normalizeChangeTime(rawTime);
+    const missing: string[] = [];
+    if (!systemId) missing.push(SOURCE_HEADERS.systemId);
+    if (!changeItem) missing.push(SOURCE_HEADERS.changeItem);
+    if (changeTime === "") missing.push(SOURCE_HEADERS.changeTime);
+    else if (changeTime === null) missing.push(`${SOURCE_HEADERS.changeTime}（無法辨識：${row[timeCol] || String(rawTime)}）`);
+    if (missing.length > 0 || typeof changeTime !== "number") {
+      stats.missingRequiredRows++;
+      errors.push(`主表第 ${rowNumber} 列（聯繫單 ${changeId}）缺少必填欄位：${missing.join("、")}，已略過。`);
+      continue;
+    }
     stats.activeRows++;
     activeChangeIds.add(changeId);
 
     const rowWarnings: string[] = [];
-    const rawTime = values[i][timeCol];
-    let changeTime = normalizeChangeTime(rawTime);
-    if (changeTime === null) {
-      rowWarnings.push(`主表第 ${rowNumber} 列變更時間無法辨識：${row[timeCol] || String(rawTime)}，已留空。`);
-      changeTime = "";
-    }
-    const metadata: SourceMetadata = { systemId: row[systemCol] || "", changeItem: row[itemCol] || "", changeTime };
+    const metadata: SourceMetadata = { systemId, changeItem, changeTime };
 
     const rawNotes = (row[scheduleCol] || "").trim();
     const cell = parseScheduleCell(rawNotes);
@@ -533,7 +545,7 @@ function runSync(workbook: ExcelScript.Workbook): SyncResult {
   const schedule = parseSourceSchedule(sourceTexts, sourceValues);
   const s = schedule.stats;
   debug(`欄位對應：${Object.keys(schedule.columns).map((k) => `${SOURCE_HEADERS[k as keyof typeof SOURCE_HEADERS]}=${columnLetter(schedule.columns[k])}`).join("，")}`);
-  debug(`來源 ${s.dataRows} 列：空白 ${s.blankRows}、已有變更結果 ${s.completedRows}、缺聯繫單號 ${s.missingChangeIdRows}、待執行 ${s.activeRows}`);
+  debug(`來源 ${s.dataRows} 列：空白 ${s.blankRows}、已有變更結果 ${s.completedRows}、缺聯繫單號 ${s.missingChangeIdRows}、缺必填欄位 ${s.missingRequiredRows}、待執行 ${s.activeRows}`);
   debug(`待執行列解析：「日期 內容」排程 ${s.scheduleLineEntries} 筆、改用變更日期 ${s.fallbackEntries} 筆（其中疑似格式錯誤 ${s.formatWarnings} 筆）、日期無效 ${s.invalidDateEntries} 筆 → 產生 ${schedule.desiredCount} 筆執行意圖`);
   const desiredKeys: string[] = [];
   schedule.desired.forEach((items) => items.forEach((item) => desiredKeys.push(`${item.changeId}／${item.date}／${item.notes || "(無內容)"}`)));
@@ -706,6 +718,9 @@ function logEmptyScheduleHints(texts: string[][], values: CellValue[][], schedul
   if (s.dataRows === s.blankRows) log("  - 標題列以下全是空白。");
   if (s.completedRows > 0 && s.activeRows === 0) log(`  - 所有 ${s.completedRows} 列的「${SOURCE_HEADERS.result}」都有值，程式視為已結案而略過。`);
   if (s.missingChangeIdRows > 0) log(`  - ${s.missingChangeIdRows} 列「${SOURCE_HEADERS.changeId}」空白。`);
+  if (s.missingRequiredRows > 0) {
+    log(`  - ${s.missingRequiredRows} 列缺少必填欄位「${SOURCE_HEADERS.systemId}」「${SOURCE_HEADERS.changeItem}」「${SOURCE_HEADERS.changeTime}」（或變更時間無法辨識）。`);
+  }
   if (s.invalidDateEntries > 0) {
     log(`  - ${s.invalidDateEntries} 筆「${SOURCE_HEADERS.changeDate}」無法辨識。支援格式：yyyy/m/d 或 yyyy-m-d（西元四位數年），或 Excel 日期值；民國年（如 115/11/20）不支援。`);
   }

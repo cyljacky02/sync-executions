@@ -579,18 +579,17 @@ function runSync(workbook: ExcelScript.Workbook): SyncResult {
   // ---- 2. 規劃（純資料）----
   step("讀取既有執行進度");
   let existing: ExistingIndex = { byKey: new Map<string, ExistingExecution[]>(), ids: new Set<string>(), blockedChangeIds: new Set<string>(), errors: [] };
-  let blankRuns: { index: number; count: number }[] = [];
   let existingRowCount = 0;
+  let existingBlankRows = 0;
   if (targetTable) {
     const body = targetTable.getRangeBetweenHeaderAndTotal();
     const texts = body.getTexts();
     existingRowCount = texts.length;
+    existingBlankRows = texts.filter((r) => r.every((v) => !v.trim())).length;
     const dateValues = body.getColumn(COL_DATE).getValues();
     existing = indexExistingExecutions(texts, dateValues, body.getRowIndex() + 1);
-    // 只有出現顯示空白的列時才讀公式，避免誤刪「公式結果為空字串」的列。
-    if (texts.some((r) => r.every((v) => !v.trim()))) blankRuns = blankRowRuns(texts, body.getFormulas());
   }
-  debug(`既有 ${existingRowCount} 列：執行代號 ${existing.ids.size} 個、聯繫單／日期組合 ${existing.byKey.size} 個、暫停新增的聯繫單 ${existing.blockedChangeIds.size} 個、可刪除空白區段 ${blankRuns.length} 個`);
+  debug(`既有 ${existingRowCount} 列（空白 ${existingBlankRows} 列）：執行代號 ${existing.ids.size} 個、聯繫單／日期組合 ${existing.byKey.size} 個、暫停新增的聯繫單 ${existing.blockedChangeIds.size} 個`);
 
   step("規劃同步");
   const plan = planSync(schedule, existing);
@@ -614,8 +613,6 @@ function runSync(workbook: ExcelScript.Workbook): SyncResult {
     progressSheet.getRange(tableAddress).setValues([EXECUTION_HEADERS, EXECUTION_HEADERS.map(() => "")]);
     targetTable = progressSheet.addTable(tableAddress, true);
     targetTable.setName(TABLE_NAME);
-    existingRowCount = 1;
-    blankRuns = [{ index: 0, count: 1 }];
     debug(`已建立 ${TABLE_NAME}（${tableAddress}，含一列佔位列）`);
   }
   const table: ExcelScript.Table = targetTable;
@@ -635,11 +632,19 @@ function runSync(workbook: ExcelScript.Workbook): SyncResult {
     debug("沒有需要新增的列。");
   }
 
-  // 刪除完全空白列（含初次建表的佔位列）；新增列附加在尾端，因此既有列索引不變。
+  // 刪除完全空白列（含初次建表的佔位列）。
+  // 必須在新增之後重新讀取表格再判斷：Excel 新增列時可能直接填入表格尾端的空白列，
+  // 若沿用新增前算好的列索引，會把剛新增的資料列當成空白列刪掉。
   // 表格至少保留一列資料列（Excel 限制）：零筆排程時佔位列會留著，其 CardSent 為空，不會觸發卡片。
+  const bodyAfterAdd = table.getRangeBetweenHeaderAndTotal();
+  const textsAfterAdd = bodyAfterAdd.getTexts();
+  // 只有出現顯示空白的列時才讀公式，避免誤刪「公式結果為空字串」的列。
+  const blankRuns = textsAfterAdd.some((r) => r.every((v) => !v.trim()))
+    ? blankRowRuns(textsAfterAdd, bodyAfterAdd.getFormulas())
+    : [];
   if (blankRuns.length > 0) {
     step("寫入：刪除空白列");
-    let remaining = existingRowCount + added;
+    let remaining = textsAfterAdd.length;
     let deleted = 0;
     blankRuns.forEach((run) => {
       const count = Math.min(run.count, remaining - 1);
@@ -704,6 +709,15 @@ function runSync(workbook: ExcelScript.Workbook): SyncResult {
     });
 
     table.getWorksheet().getFreezePanes().freezeRows(1);
+  }
+
+  // 寫入後驗證：每個計畫新增的執行代號都必須真的在表格裡，否則回報，不讓「新增成功但少一筆」靜默發生。
+  step("驗證：確認新增列都在表格中");
+  if (added > 0) {
+    const presentIds = new Set(columnOf(table, "執行代號").getRangeBetweenHeaderAndTotal().getTexts().map((r) => normalizeText(r[0] || "")));
+    const missingIds = plan.newRows.map((r) => r.executionId).filter((id) => !presentIds.has(id));
+    if (missingIds.length > 0) errors.push(`新增後在 ${TABLE_NAME} 找不到：${missingIds.join("、")}，請重新執行同步並回報此訊息。`);
+    debug(`新增列驗證：預期 ${added} 筆，遺失 ${missingIds.length} 筆`);
   }
 
   step("完成");
